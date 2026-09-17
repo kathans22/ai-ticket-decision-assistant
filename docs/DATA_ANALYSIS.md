@@ -265,3 +265,78 @@ Calculated using exact UTF-8 character lengths with token estimates computed at 
 - **Rule 5**: If the report does not identify what was ordered versus what was received, request more information.
   - *Condition*: Missing ordered/received item description.
   - *Implied Action*: `NEEDS_MORE_INFORMATION`
+
+---
+
+## 5. DATA_NOTES.md Constraints & Implications
+
+The instructions and caveats in `docs/DATA_NOTES.md` establish binding technical and architectural constraints:
+
+### 5.1 Fully Synthetic Data
+- **Caveat**: "The supplied data is fully synthetic and contains no real customer information."
+- **Implication**:
+  - All test customer IDs (`C1254`, etc.) and names (`Vihaan`, `Tanvi`) are artificial.
+  - Local logging, SQLite storage, and offline evaluation can run safely without GDPR/PII anonymization pipelines or external mock providers.
+
+### 5.2 Role of `tickets.csv` vs AI Decision Endpoint
+- **Caveat**: "`tickets.csv` represents historical support tickets. `resolved_action` is the historical decision for that ticket. Your AI decision endpoint should not simply look up or copy a historical row. It should use the current ticket information and the supplied policy knowledge base to determine an action."
+- **Implication**:
+  - **Zero-Lookup Mandate**: The application cannot use nearest-neighbor lookup, semantic search, or fuzzy matching against `tickets.csv` to bypass reasoning.
+  - The decision engine must ground every decision exclusively in `knowledge_base/*.md` policy chunks retrieved via RAG.
+  - `tickets.csv` serves strictly as historical validation and evaluation data for system accuracy tuning.
+
+### 5.3 Purpose of Visible Sample Test Cases
+- **Caveat**: "The visible sample test cases are intended only to verify that your implementation works end-to-end."
+- **Implication**:
+  - The 5 cases in `sample_test_cases.json` are smoke tests, not the complete test distribution.
+  - Any overfitting, hardcoded rule shortcuts matching the 5 message strings, or narrow prompt engineering tailored only to these 5 samples will fail on the hidden evaluation suite (which covers all 15 action labels).
+
+---
+
+## 6. Traps and Conflicts
+
+### 6.1 Overlapping Policies & Precedence Boundaries
+1. **Damaged Goods vs. Defective Products vs. Wrong Item**:
+   - *Physical transit damage* (`damaged_goods.md`): Applies to crushed, shattered, or leaking goods. Window is **7 days**. Evidence threshold is **₹2,000** (above ₹2,000 requires photos -> `REQUEST_PHOTOS`; at or below ₹2,000 -> `APPROVE_REFUND_OR_REPLACEMENT`).
+   - *Functional defect* (`defective_products.md`): Applies to electronic or mechanical failure where the item arrives intact but does not work. Window is **14 days**. Evidence threshold is **₹3,000** (above ₹3,000 requires defect proof -> `REQUEST_DEFECT_EVIDENCE`; at or below ₹3,000 -> `APPROVE_REPLACEMENT`).
+   - *Boundary clause*: `defective_products.md` Rule 4 explicitly states: *"Cosmetic damage should be evaluated under the Damaged Goods Policy."*
+   - *Wrong Item* (`wrong_item.md`): Applies when an item or flavor does not match the order. Window is **7 days**. Standard action is `REPLACE_CORRECT_ITEM`. If out of stock, `OFFER_REPLACEMENT_OR_REFUND`.
+
+2. **Return (Change of Mind) vs. Cancellation vs. Damaged**:
+   - *Cancellation* (`cancellations.md`): Applies exclusively before dispatch (`CANCEL_AND_REFUND`). Once status is `dispatched` or `delivered`, cancellation is blocked (`CANNOT_CANCEL_AFTER_DISPATCH`).
+   - *Returns* (`returns.md`): Applies only after delivery. Non-food products must be **unopened** and reported within **14 days** (`APPROVE_RETURN`). Opened non-food returns are barred (`REJECT_OPENED_ITEM`). Food returns are barred even if unopened (`REJECT_FOOD_RETURN`).
+   - *Critical Distinction*: Food items cannot be returned due to change of mind (`REJECT_FOOD_RETURN`), but if a food product arrives *damaged*, it is covered under `damaged_goods.md` (`APPROVE_REFUND_OR_REPLACEMENT` as confirmed by 18 historical tickets in `tickets.csv`).
+
+### 6.2 Missing Facts Triggering `NEEDS_MORE_INFORMATION`
+Across all 6 policies, if critical facts are missing, the system must trigger `NEEDS_MORE_INFORMATION` instead of guessing:
+- **Cancellations**: Missing or unknown `order_status` (dispatch status).
+- **Damaged Goods**: Missing delivery date (`days_since_delivery` is null) or missing description of what was damaged.
+- **Defective Products**: Missing delivery date or nature of the defect.
+- **Returns**: Missing `product_type` (`unknown`), missing `opened_status` (`unknown`), or missing `days_since_delivery`.
+- **Shipping**: Missing dispatch date (`days_since_dispatch` is null) while order status is dispatched.
+- **Wrong Item**: Missing details comparing what was ordered vs. what was received.
+
+### 6.3 Brief vs. Actual Candidate Pack Discrepancies
+- The assignment brief (`docs/ASSIGNMENT.md`) mentions a policy file named `refunds.md`.
+- **Reality in candidate pack**: There is **no `refunds.md`**.
+- The candidate pack contains 6 concrete policy files:
+  1. `cancellations.md`
+  2. `damaged_goods.md`
+  3. `defective_products.md`
+  4. `returns.md`
+  5. `shipping.md`
+  6. `wrong_item.md`
+- **Resolution**: Refunds are not a standalone policy file; refund decisions are distributed across `cancellations.md` (full refund pre-dispatch), `damaged_goods.md` (refund/replace for damaged ≤ ₹2,000), `shipping.md` (refund/replace for lost in transit > 10 days), and `wrong_item.md` (refund if correct item unavailable). The RAG knowledge base must ingest these 6 actual files.
+
+### 6.4 Test Case Consistency Check & Nuances
+- **Case S01**: ₹3,500 non-food, delivered 1 day ago, opened, damaged.
+  - Value ₹3,500 > ₹2,000 threshold in `damaged_goods.md` Rule 3 -> `REQUEST_PHOTOS`. **Consistent.**
+- **Case S02**: ₹1,200 non-food, unopened, delivered 10 days ago.
+  - Delivery 10 days ≤ 14 days in `returns.md` Rule 1 -> `APPROVE_RETURN`. **Consistent.**
+- **Case S03**: Dispatched 9 days ago, undelivered.
+  - Days 9 falls in [8, 10] window in `shipping.md` Rule 3 -> `OPEN_SHIPPING_INVESTIGATION`. **Consistent.**
+- **Case S04**: Wrong flavor received 2 days ago, food, unopened.
+  - Days 2 ≤ 7 days in `wrong_item.md` Rule 1 & 2 -> `REPLACE_CORRECT_ITEM`. **Consistent.**
+- **Case S05**: "I want to return this.", ₹900, delivered, but `days_since_delivery` is null, `product_type` is unknown, `opened_status` is unknown.
+  - Returns policy Rule 5 mandates requesting info when product type, opened status, or delivery date is missing -> `NEEDS_MORE_INFORMATION`. **Consistent.**
+
