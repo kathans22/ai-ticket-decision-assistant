@@ -340,3 +340,44 @@ Across all 6 policies, if critical facts are missing, the system must trigger `N
 - **Case S05**: "I want to return this.", ₹900, delivered, but `days_since_delivery` is null, `product_type` is unknown, `opened_status` is unknown.
   - Returns policy Rule 5 mandates requesting info when product type, opened status, or delivery date is missing -> `NEEDS_MORE_INFORMATION`. **Consistent.**
 
+---
+
+## 7. RAG vs. CAG (Context / Cache-Augmented Generation)
+
+### 7.1 Quantitative Context Window Sizing
+- **Total Knowledge Base Characters**: 2,961 characters.
+- **Estimated Total Token Count**: ~740 tokens (using standard heuristic `chars / 4.0`).
+- **Target Model Context Capacity**: Modern Gemini models (e.g. `gemini-1.5-flash`, `gemini-2.5-flash`, or `gemini-2.0-flash`) support context windows between 1,000,000 and 2,000,000 tokens.
+- **Context Utilization Percentage**:
+  $$\frac{740 \text{ tokens}}{1,000,000 \text{ tokens}} \approx 0.074\%$$
+
+### 7.2 CAG / Full-Context Feasibility
+The entire knowledge base of 6 markdown files fits comfortably within a single LLM prompt, consuming less than 0.1% of available context. In a pure Cache-Augmented Generation (CAG) architecture, pre-loading all 6 policies into a system prompt (or utilizing Gemini context caching) is not only feasible, but eliminates any vector retrieval recall error.
+
+### 7.3 Why RAG Architecture is Mandatory for This Solution
+Despite the small synthetic knowledge base, a formal RAG pipeline (chunking -> Gemini embedding -> SQLite storage -> NumPy KNN similarity search) is implemented for vital production reasons:
+1. **Assignment Architecture & Evaluation**: The brief and playbook explicitly evaluate the engineering of heading-aware chunking, vector embeddings, similarity search, and provenance linking.
+2. **Enterprise Extensibility**: Real-world customer support repositories scale from 6 files to thousands of catalog items, regional legal addenda, warranty disclaimers, and courier SLAs spanning tens of millions of tokens, where full stuffing is neither economically viable nor latency-efficient.
+3. **Auditability & Provenance (Grounded Citations)**: RAG retrieves discrete chunks with identifiable metadata (`source: knowledge_base/damaged_goods.md`, heading `Damaged Goods Policy`). This enables the decision engine to output verifiable evidence sources that can be audited by human support leads.
+4. **Token Cost & Latency Optimization**: Injecting top-k (e.g., k=2 or k=3) relevant chunks requires ~150–250 tokens per API call compared to 740+ tokens for full-pack stuffing, yielding lower inference latency and lower API costs at scale.
+
+---
+
+## 8. Open Questions & Design Decisions
+
+1. **Inventory Availability Assumption in `wrong_item.md`**:
+   - Rule 3 indicates: *"If the originally ordered item is unavailable, offer a refund."* (`OFFER_REPLACEMENT_OR_REFUND`).
+   - *Observation*: The ticket schema (`tickets.csv` / test cases) contains no inventory or stock field.
+   - *Working Assumption*: Assume inventory is available (`REPLACE_CORRECT_ITEM`) unless the ticket message explicitly mentions that the item is out of stock.
+
+2. **Metadata Nulls vs. Message Text Extraction**:
+   - If structured metadata has `days_since_delivery: null` but the customer message explicitly states *"delivered yesterday"* (as in `S01`), should the decision engine infer `days_since_delivery = 1`, or treat missing structured fields as requiring clarification (`NEEDS_MORE_INFORMATION`)?
+   - *Observation*: In `S01`, `days_since_delivery` is provided as `1` in the payload; in `S05`, `days_since_delivery` is `null` and the message has no date, leading to `NEEDS_MORE_INFORMATION`. The RAG pipeline should combine structured metadata with extracted message facts when metadata is missing, falling back to `NEEDS_MORE_INFORMATION` when neither provides the needed fact.
+
+3. **Strict Validation of Action Vocabulary**:
+   - The decision pipeline will enforce the exact 15-label vocabulary via a Pydantic `Literal` enumeration. Any response deviating from these exact strings will fail schema validation and be rejected by guardrails.
+
+4. **Multi-Issue Precedence**:
+   - When a ticket describes both cosmetic package damage and wrong item or return, the explicit boundary rule in `defective_products.md` and `returns.md` prioritizes the `Damaged Goods Policy`.
+
+
